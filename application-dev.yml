@@ -1,0 +1,16 @@
+#Configuraçôes para **DESENVOLVIMENTO LOCAL**
+# Ative com: SPRING_PROFILES_ACTIVE=dev
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/postgres
+    username: postgres
+    password: 9800
+    driver-class-name: org.postgresql.Drive
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+ai-engine:
+  url: http://localhost:8001

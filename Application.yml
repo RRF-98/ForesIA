@@ -1,0 +1,41 @@
+#configurações COMUNS - carregado em todos os ambientes
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: foresia
+    jpa:
+      hibernate:
+        ddl-ato: update #cria/atualiza tabelas atumaticaments
+      show-sql: true #mostra SQL no console
+      properties:
+        hibernate:
+          format_sql: true
+          dialect: org.hibernate.dialect.PostgreSQLDialect
+    flyway:
+      enabled: false #Desabilita enquanto usa ddl-auto
+    servlet:
+      multipart:
+        enabled: true
+        max-file-size: 50MB
+        max-request-size: 100MB
+jwt:
+  secret:
+  expiration: 3600000
+
+spring-doc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+  api-docs:
+    path: /api-docs
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: always
