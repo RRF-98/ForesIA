@@ -22,7 +22,7 @@ spring:
         max-file-size: 50MB
         max-request-size: 100MB
 jwt:
-  secret:
+  secret: ForensIA2026!ProjetoTCC@ChaveSecretaSuperSegura998877
   expiration: 3600000
 
 spring-doc:
