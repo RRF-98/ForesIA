@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+import logging
+import re
+import statistics
+from dataclasses import dataclass
+from typing import Optional, Any
+
+# Import centralizado — AnalysisResult vive em models/schemas.py
+# Todos os services importam daqui, garantindo contrato único com o Java
+# Assumindo que app.models.schemas existe e contém AnalysisResult
+# from app.models.schemas import AnalysisResult # Comentado para ser um arquivo standalone
+
+logger = logging.getLogger(__name__)
+
+# --- Constantes de classificação ---
+THRESHOLD_HUMANO  = 30.0   # 0–30%  → Humano
+THRESHOLD_HIBRIDO = 70.0   # 30–70% → Híbrido
+                            # >70%   → IA
+
+MIN_CHARS_RELIABLE = 150   # abaixo disso emitimos warning de acurácia reduzida
+
+# --- Dataclass de resultado (mesma estrutura esperada pelo router) ---
+@dataclass
+class AnalysisResult:
+    probability: float          # 0.0 – 100.0
+    classification: str         # "Humano" | "Híbrido" | "IA"
+    warning: Optional[str] = None
+    details: Optional[dict] = None # Para explicabilidade
+
+
+# --- Função de carregamento — chamada UMA VEZ pelo lifespan do main.py ---
+def load_model() -> Optional[Any]:
+    """
+    Instancia o pipeline RoBERTa para detecção de texto gerado por IA.
+    Retorna o pipeline se bem-sucedido, ou None se o modelo não estiver
+    disponível (sem internet, sem memória).
+    """
+    try:
+        from transformers import pipeline
+        logger.info("Carregando modelo RoBERTa — pode demorar no primeiro boot...")
+
+        detector = pipeline(
+            task="text-classification",
+            model="Hello-SimpleAI/chatgpt-detector-roberta",
+            truncation=True,
+            max_length=512,
+        )
+
+        logger.info("Modelo RoBERTa carregado com sucesso.")
+        return detector
+
+    except Exception as exc:
+        logger.warning(
+            "Modelo RoBERTa indisponível: %s. Fallback: heurísticas linguísticas.",
+            exc,
+        )
+        return None
+
+
+# --- FUNÇÃO PRINCIPAL CONSOLIDADA ---
+def analyze_text(text: str, model: Optional[Any]) -> AnalysisResult:
+    """
+    Recebe o texto bruto e o modelo já carregado (ou None).
+    Retorna um AnalysisResult Pydantic pronto para serialização JSON.
+
+    Integra chunking, ponderação inteligente e detalhes de heurísticas.
+    """
+    text = text.strip()
+
+    warning: Optional[str] = None
+    if len(text) < MIN_CHARS_RELIABLE:
+        warning = (
+            f"Texto curto ({len(text)} caracteres) — acurácia reduzida. "
+            "Recomendado mínimo de 150 caracteres."
+        )
+
+    model_probability = None
+    heuristic_probability = None
+    heuristic_details = {}
+
+    # --- Processamento com Modelo (com chunking para textos longos) ---
+    if model is not None:
+        # Divide em blocos de ~500 caracteres para analisar o texto todo
+        # O RoBERTa tem max_length=512, então 500 é um bom chunk_size
+        chunk_size = 500
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+        if chunks:
+            # Analisa cada bloco e tira a média
+            probs = [_predict_with_model(model, c) for c in chunks]
+            model_probability = sum(probs) / len(probs)
+
+    # --- Processamento com Heurísticas ---
+    heuristic_probability, heuristic_details = _predict_with_heuristics(text)
+
+    # --- Ponderação Inteligente ---
+    final_probability = 50.0 # Valor neutro padrão
+
+    if model_probability is not None and heuristic_probability is not None:
+        # Ponderação: 70% modelo, 30% heurísticas para um texto genérico
+        # Isso pode ser ajustado com base na confiança do modelo ou detecção de idioma
+        final_probability = (model_probability * 0.7) + (heuristic_probability * 0.3)
+    elif model_probability is not None:
+        final_probability = model_probability
+    elif heuristic_probability is not None:
+        final_probability = heuristic_probability
+
+    # --- Monta e retorna o resultado ---
+    return AnalysisResult(
+        probability=round(final_probability, 2),
+        classification=_classify(final_probability),
+        warning=warning,
+        details=heuristic_details
+    )
+
+
+# --- Predição com RoBERTa ---
+def _predict_with_model(model: Any, text: str) -> float:
+    """
+    Usa o pipeline HuggingFace para calcular probabilidade de ser IA.
+    """
+    try:
+        result = model(text)[0]
+        score: float = result["score"]
+
+        if result["label"] == "Fake":
+            return score * 100.0
+        else:
+            return (1.0 - score) * 100.0
+
+    except Exception as exc:
+        logger.error("Erro na inferência RoBERTa: %s. Usando heurísticas como fallback para este chunk.", exc)
+        # Se um chunk falhar, retorna a probabilidade das heurísticas para ele
+        prob, _ = _predict_with_heuristics(text) # Ignora detalhes aqui, pois é um chunk
+        return prob
+
+
+# --- Predição por heurísticas linguísticas (fallback e complementar) ---
+def _predict_with_heuristics(text: str) -> tuple[float, dict]:
+    """
+    Cinco heurísticas linguísticas ponderadas que indicam texto gerado por IA.
+    Retorna a probabilidade e um dicionário com os detalhes da ativação das heurísticas.
+    """
+    score = 0.0
+    max_score = 0.0
+    details = {}
+
+    words = text.split()
+    n_words = max(len(words), 1)
+
+    # ── 1. Uniformidade de comprimento das sentenças (peso 25) ────────────
+    max_score += 25
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    if len(sentences) >= 3:
+        lengths = [len(s.split()) for s in sentences if s.strip()]
+        if lengths and len(lengths) > 1:
+            stdev = statistics.stdev(lengths)
+            mean  = statistics.mean(lengths)
+            cv    = (stdev / mean) if mean > 0 else 1
+            details['uniformidade_sentencas_cv'] = round(cv, 2)
+            if cv < 0.15:
+                score += 25
+                details['uniformidade_sentencas'] = 'Muito Alta'
+            elif cv < 0.30:
+                score += 15
+                details['uniformidade_sentencas'] = 'Alta'
+            elif cv < 0.45:
+                score += 5
+                details['uniformidade_sentencas'] = 'Moderada'
+        else:
+            details['uniformidade_sentencas'] = 'N/A (poucas sentenças)'
+    else:
+        details['uniformidade_sentencas'] = 'N/A (poucas sentenças)'
+
+    # ── 2. Densidade de palavras de transição típicas de IA (peso 20) ─────
+    max_score += 20
+    ai_transitions = [
+        r"\bno entanto\b", r"\bcontudo\b", r"\bpor outro lado\b",
+        r"\bé importante (ressaltar|destacar|notar)\b",
+        r"\bem conclusão\b", r"\bpor conseguinte\b",
+        r"\bfica evidente que\b", r"\bcabe destacar\b",
+        r"\bnesse sentido\b", r"\bsendo assim\b",
+        r"\bdiante do exposto\b", r"\bem suma\b",
+        r"\bpodemos observar\b", r"\bvale ressaltar\b",
+    ]
+    n_transitions = sum(                              # conta padrões encontrados
+        1 for pat in ai_transitions
+        if re.search(pat, text, re.IGNORECASE)        # case-insensitive
+    )
+    density = n_transitions / (n_words / 100) if n_words > 0 else 0
+    details['densidade_transicoes'] = round(density, 2)
+    if density > 3:
+        score += 20
+        details['uso_transicoes_ia'] = 'Muito Alto'
+    elif density > 1.5:
+        score += 12
+        details['uso_transicoes_ia'] = 'Alto'
+    elif density > 0.5:
+        score += 5
+        details['uso_transicoes_ia'] = 'Moderado'
+    else:
+        details['uso_transicoes_ia'] = 'Baixo'
+
+    # ── 3. Ausência de marcadores de primeira pessoa (peso 15) ────────────
+    max_score += 15
+    first_person = [
+        r"\beu\b", r"\bminha?\b", r"\bacho\b", r"\bpenso\b",
+        r"\bacredito\b", r"\bpra mim\b", r"\bna minha\b"
+    ]
+    has_first_person = any(
+        re.search(p, text, re.IGNORECASE) for p in first_person
+    )
+    if not has_first_person and n_words > 50:
+        score += 15
+        details['primeira_pessoa'] = 'Ausente (suspeito)'
+    else:
+        details['primeira_pessoa'] = 'Presente ou texto curto'
+
+    # ── 4. Repetição de estrutura de parágrafos (peso 20) ─────────────────
+    max_score += 20
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(paragraphs) >= 3:
+        para_lengths = [len(p.split()) for p in paragraphs]
+        if len(para_lengths) > 1:
+            p_stdev = statistics.stdev(para_lengths)
+            p_mean  = statistics.mean(para_lengths)
+            p_cv    = p_stdev / p_mean if p_mean > 0 else 1
+            details['uniformidade_paragrafos_cv'] = round(p_cv, 2)
+            if p_cv < 0.20:
+                score += 20
+                details['uniformidade_paragrafos'] = 'Muito Alta'
+            elif p_cv < 0.35:
+                score += 10
+                details['uniformidade_paragrafos'] = 'Alta'
+        else:
+            details['uniformidade_paragrafos'] = 'N/A (poucos parágrafos)'
+    else:
+        details['uniformidade_paragrafos'] = 'N/A (poucos parágrafos)'
+
+    # ── 5. Densidade de vocabulário formal (peso 20) ──────────────────────
+    max_score += 20
+    formal_words = [
+        r"\butilizar\b", r"\bdenominar\b", r"\bpossibilitar\b",
+        r"\bviabilizar\b", r"\botimizar\b", r"\bimplementar\b",
+        r"\bsistematizar\b", r"\bcorroborar\b", r"\bnormatizar\b",
+        r"\bpotencializar\b", r"\bconsubstanciar\b",
+    ]
+    n_formal = sum(
+        1 for w in formal_words
+        if re.search(w, text, re.IGNORECASE)
+    )
+    formal_density = n_formal / (n_words / 100) if n_words > 0 else 0
+    details['densidade_vocabulario_formal'] = round(formal_density, 2)
+    if formal_density > 2.5:
+        score += 20
+        details['uso_vocabulario_formal'] = 'Muito Alto'
+    elif formal_density > 1.0:
+        score += 10
+        details['uso_vocabulario_formal'] = 'Alto'
+    elif formal_density > 0.3:
+        score += 4
+        details['uso_vocabulario_formal'] = 'Moderado'
+    else:
+        details['uso_vocabulario_formal'] = 'Baixo'
+
+    # ── Normalização para [0, 100] ────────────────────────────────────────
+    if max_score == 0:
+        return 50.0, details  # sem dados suficientes para heurísticas, retorna neutro
+
+    raw = (score / max_score) * 100.0
+    # Suaviza extremos: heurísticas nunca chegam a 0% ou 100% de certeza
+    return max(5.0, min(95.0, raw)), details
+
+
+# --- Classificação a partir da probabilidade ---
+def _classify(probability: float) -> str:
+    """
+    Aplica os limiares definidos nas constantes do módulo.
+    """
+    if probability <= THRESHOLD_HUMANO:
+        return "Humano"
+    if probability <= THRESHOLD_HIBRIDO:
+        return "Híbrido"
+    return "IA"
